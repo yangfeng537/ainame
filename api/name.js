@@ -1,33 +1,54 @@
 // ============================================
-// api/name.js — AI 起名接口（阶段1：单模型豆包/火山方舟）
+// api/name.js — AI 起名接口（阶段2：多模型切换 modelConfigMap）
 // 练习三：AI 起名平台
-// 流程：接收前端需求 -> 流式调用豆包 -> 边生成边转发给前端(SSE) -> 存 Supabase
+// 加新模型 = 在 modelConfigMap 里加一项配置，调用代码一行都不用改
 // 密钥全部从环境变量读取，不写死在代码里
 // ============================================
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
-// ---- 从环境变量读取配置 ----
-const DOUBAO_API_KEY = process.env.DOUBAO_API_KEY;                                            // 火山方舟 API Key
-const DOUBAO_BASE_URL = process.env.DOUBAO_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v1'; // 火山方舟接口地址
-const DOUBAO_MODEL = process.env.DOUBAO_MODEL || 'doubao-seed-2-1-turbo';                      // 使用的模型 ID
-const SUPABASE_URL = process.env.SUPABASE_URL;                                                // Supabase 地址
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;                                      // Supabase 匿名密钥
+// ---- 模型配置表：每个模型的地址、密钥、模型名集中在这里 ----
+const modelConfigMap = {
+  doubao: {
+    baseUrl: process.env.DOUBAO_BASE_URL || 'https://ark.cn-beijing.volces.com/api/v1',
+    apiKey: process.env.DOUBAO_API_KEY,
+    model: process.env.DOUBAO_MODEL || 'doubao-seed-2-1-turbo-260628',
+    extraBody: { thinking: { type: 'disabled' } }, // 豆包2.1系：关闭思考链，回答直接出
+  },
+  deepseek: {
+    baseUrl: process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1',
+    apiKey: process.env.DEEPSEEK_API_KEY,
+    model: process.env.DEEPSEEK_MODEL || 'deepseek-chat',
+    extraBody: {},
+  },
+};
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 
 module.exports = async function handler(req, res) {
-  // 1) 只接受 POST 请求
+  // 1) 只接受 POST
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
-  // 2) 读取用户输入的起名需求
-  const { requirement } = req.body || {};
+  // 2) 读取用户输入：起名需求 + 选择的模型
+  const { requirement, model } = req.body || {};
   if (!requirement || !requirement.trim()) {
     return res.status(400).json({ error: '请输入起名需求' });
   }
 
-  // 3) 组装提示词：要求输出 3 组名字 + 寓意解释
+  // 3) 按模型名查配置表，拿到这家模型的地址/密钥/模型 ID
+  const config = modelConfigMap[model];
+  if (!config) {
+    return res.status(400).json({ error: `未知模型：${model}，可选：${Object.keys(modelConfigMap).join('、')}` });
+  }
+  if (!config.apiKey) {
+    return res.status(400).json({ error: `模型 ${model} 还没配置密钥（环境变量缺失）` });
+  }
+
+  // 4) 组装提示词
   const systemPrompt =
     '你是一位专业的起名专家，擅长结合文化内涵、寓意、音韵为不同对象起名。' +
     '回答必须使用简体中文，格式清晰。';
@@ -38,7 +59,7 @@ module.exports = async function handler(req, res) {
     '2. 寓意解释（一句话，说清含义和出处）\n' +
     '最后用一句简短的话总结整体起名思路。';
 
-  // 4) 设置 SSE 响应头，告诉浏览器：下面要流式输出
+  // 5) SSE 响应头：流式输出
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -47,33 +68,31 @@ module.exports = async function handler(req, res) {
   });
 
   try {
-    // 5) 调用豆包（火山方舟）的 OpenAI 兼容接口
-    //    （对应官方 curl 示例，只是把 curl 换成了 Node 的 fetch，stream 打开）
-    const upstream = await fetch(`${DOUBAO_BASE_URL}/chat/completions`, {
+    // 6) 一套共用调用代码：换模型只是换配置表里的那一行
+    const upstream = await fetch(`${config.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${DOUBAO_API_KEY}`,
+        Authorization: `Bearer ${config.apiKey}`,
       },
       body: JSON.stringify({
-        model: DOUBAO_MODEL,
+        model: config.model,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        thinking: { type: 'disabled' }, // 关闭思考链，起名回答直接出
-        stream: true, // 关键：打开流式输出
+        ...(config.extraBody || {}),
+        stream: true,
       }),
     });
 
-    // 6) 上游报错时，把错误以 SSE 事件推给前端显示
     if (!upstream.ok) {
       const errText = (await upstream.text()).slice(0, 300);
       res.write(`event: error\ndata: ${JSON.stringify({ message: `模型调用失败（HTTP ${upstream.status}）：${errText}` })}\n\n`);
       return res.end();
     }
 
-    // 7) 边接收上游的流、边原样转发给前端（实现"边生成边显示"）
+    // 7) 边接收上游流、边转发给前端
     const reader = upstream.body.getReader();
     const decoder = new TextDecoder();
     let raw = '';
@@ -82,11 +101,11 @@ module.exports = async function handler(req, res) {
       const { done, value } = await reader.read();
       if (done) break;
       const chunk = decoder.decode(value, { stream: true });
-      raw += chunk;       // 同时攒一份完整内容，后面存数据库用
-      res.write(chunk);   // 转发给浏览器
+      raw += chunk;
+      res.write(chunk);
     }
 
-    // 8) 流结束后，把完整结果保存到 Supabase（作业要求：需求、方案、模型）
+    // 8) 流结束后存 Supabase：需求 + 结果 + 模型
     const nameResult = parseSSE(raw);
     if (SUPABASE_URL && SUPABASE_ANON_KEY) {
       try {
@@ -94,7 +113,7 @@ module.exports = async function handler(req, res) {
         const { error } = await supabase.from('name_history').insert({
           user_requirement: requirement.trim(),
           name_result: nameResult,
-          model_name: DOUBAO_MODEL,
+          model_name: config.model,
         });
         if (error) {
           res.write(`event: note\ndata: ${JSON.stringify({ message: `名字已生成，但保存历史失败：${error.message}` })}\n\n`);
@@ -111,7 +130,7 @@ module.exports = async function handler(req, res) {
   }
 };
 
-// 解析 OpenAI 兼容的 SSE 分片，拼出完整文本
+// 解析 OpenAI 兼容 SSE 分片，拼出完整文本
 function parseSSE(raw) {
   let text = '';
   for (const line of raw.split('\n')) {
@@ -122,9 +141,7 @@ function parseSSE(raw) {
       const json = JSON.parse(data);
       const delta = json.choices?.[0]?.delta?.content;
       if (delta) text += delta;
-    } catch (_) {
-      // 忽略解析不了的行
-    }
+    } catch (_) {}
   }
   return text.trim();
 }

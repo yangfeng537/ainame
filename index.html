@@ -27,6 +27,11 @@
     .row { display: flex; align-items: center; justify-content: space-between; margin-top: 14px; gap: 12px; }
     .model-tag { font-size: 13px; color: #6b7280; }
     .model-tag b { color: #0d9488; }
+    .model-select {
+      font-size: 14px; padding: 8px 10px; border-radius: 8px;
+      border: 1px solid #d1d5db; background: #fff; color: #1f2937; outline: none; cursor: pointer;
+    }
+    .model-select:focus { border-color: #0d9488; }
     button {
       background: #0d9488; color: #fff; border: none; padding: 10px 24px; font-size: 15px;
       border-radius: 10px; cursor: pointer; font-weight: 600; transition: background .2s; white-space: nowrap;
@@ -53,7 +58,10 @@
     <div class="card">
       <textarea id="requirement" placeholder="例如：男孩、国风、简约；或者：科技公司起名、要国际化、朗朗上口"></textarea>
       <div class="row">
-        <span class="model-tag">当前模型：<b>豆包（火山方舟）</b></span>
+        <select id="modelSelect" class="model-select">
+          <option value="doubao">豆包（doubao-seed-2.1-turbo）</option>
+          <option value="deepseek">DeepSeek（deepseek-chat）</option>
+        </select>
         <button id="btn">开始起名</button>
       </div>
       <div id="status"></div>
@@ -79,10 +87,11 @@
       output.textContent = '';
 
       try {
+        const model = document.getElementById('modelSelect').value;
         const res = await fetch('/api/name', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ requirement })
+          body: JSON.stringify({ requirement, model })
         });
 
         if (!res.ok || !res.body) {
